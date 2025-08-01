@@ -21,6 +21,13 @@ from monai.handlers import (
     MetricLogger,
     MetricsSaver,
 )
+import torch.nn.functional as F
+
+import torch.multiprocessing as mp
+from torch.utils.data.distributed import DistributedSampler
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.distributed import init_process_group, destroy_process_group
+import os
 
 from .data import segmentation_dataloaders
 from .model import get_model
@@ -206,6 +213,13 @@ def get_evaluator(
     return evaluator
 
 
+def ddp_setup():
+    torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
+    init_process_group(backend="nccl", init_method="env://")
+
+def ddp_cleanup():
+    destroy_process_group()
+
 class SegmentationTrainer(monai.engines.SupervisedTrainer):
     "Default Trainer für supervised segmentation task"
 
@@ -217,14 +231,33 @@ class SegmentationTrainer(monai.engines.SupervisedTrainer):
         metrics: list = ["MeanDice", "HausdorffDistance", "SurfaceDistance"],
         save_latest_metrics: bool = True,
     ):
+        self.run_id = config.get("run_id", "tumor")
+        self.log_id = config.get("log_dir", "logs")
+
+        ddp_setup()
+        self.local_rank = int(os.environ["LOCAL_RANK"])
+        self.device = torch.device(f"cuda:{self.local_rank}")
+
         self.config = config
         self._prepare_dirs()
-        self.config.device = torch.device(self.config.device)
+        # self.config.device = 'cuda' if torch.cuda.is_available() else 'cpu'
+        if not torch.cuda.is_available():
+            print("Running on CPU — disabling AMP and CUDA-related configs.")
+        self.device = torch.device(self.config.device)
 
         train_loader, val_loader = segmentation_dataloaders(
             config=config, train=True, valid=True, test=False
         )
-        network = get_model(config=config).to(config.device)
+         # Ensure DDP samplers
+        if not isinstance(train_loader.sampler, DistributedSampler):
+            train_loader.sampler = DistributedSampler(train_loader.dataset)
+        if not isinstance(val_loader.sampler, DistributedSampler):
+            val_loader.sampler = DistributedSampler(val_loader.dataset, shuffle=False)
+
+        # network = get_model(config=config).to(self.device)
+        network = get_model(config=config).to(self.device)
+        network = DDP(network, device_ids=[self.local_rank])
+
         optimizer = get_optimizer(network, config=config)
         loss_fn = get_loss(config=config)
         val_post_transforms = get_val_post_transforms(config=config)
@@ -232,7 +265,7 @@ class SegmentationTrainer(monai.engines.SupervisedTrainer):
 
         self.evaluator = get_evaluator(
             config=config,
-            device=config.device,
+            device=self.device,
             network=network,
             val_data_loader=val_loader,
             val_post_transforms=val_post_transforms,
@@ -241,7 +274,7 @@ class SegmentationTrainer(monai.engines.SupervisedTrainer):
         train_handlers = get_train_handlers(self.evaluator, config=config)
 
         super().__init__(
-            device=config.device,
+            device=self.device,
             max_epochs=self.config.training.max_epochs,
             train_data_loader=train_loader,
             network=network,
@@ -258,13 +291,22 @@ class SegmentationTrainer(monai.engines.SupervisedTrainer):
             self._add_progress_bars()
 
         self.schedulers = []
-        # add different metrics dynamically
-        for m in metrics:
-            getattr(monai.handlers, m)(
-                include_background=False,
-                reduction="mean",
-                output_transform=from_engine(["pred", "label"]),
-            ).attach(self.evaluator, m)
+        try:
+            import skimage.measure
+            attach_hausdorff = True
+        except ImportError:
+            print("scikit-image not found, skipping HausdorffDistance and SurfaceDistance.")
+            import subprocess
+            subprocess.check_call([sys.executable, "-m", "pip", "install", "scikit-image"])
+            attach_hausdorff = False
+
+        if attach_hausdorff:
+            for m in ["HausdorffDistance", "SurfaceDistance"]:
+                getattr(monai.handlers, m)(
+                    include_background=False,
+                    reduction="mean",
+                    output_transform=from_engine(["pred", "label"]),
+                ).attach(self.evaluator, m)
 
         self._add_metrics_logger()
         # add eval loss to metrics
@@ -275,9 +317,9 @@ class SegmentationTrainer(monai.engines.SupervisedTrainer):
 
     def _prepare_dirs(self) -> None:
         # create run_id, copy config file for reproducibility
-        os.makedirs(self.config.run_id, exist_ok=True)
-        with open(os.path.join(self.config.run_id, "config.yaml"), "w+") as f:
-            f.write(yaml.safe_dump(self.config))
+        os.makedirs(self.run_id, exist_ok=True)
+        with open(os.path.join(self.run_id, "config.yaml"), "w+") as f:
+            yaml.safe_dump(self.config)
 
         # delete old log_dir
         if os.path.exists(self.config.log_dir):
@@ -355,15 +397,12 @@ class SegmentationTrainer(monai.engines.SupervisedTrainer):
             # get name of last checkpoint
             checkpoint = os.path.join(
                 self.config.model_dir,
-                f"network_{self.config.run_id}_key_metric={self.evaluator.state.best_metric:.4f}.pt",
+                f"network_{self.run_id}_key_metric={self.evaluator.state.best_metric:.4f}.pt",
             )
 
         # If map_location is not provided, try to use the current device or fall back to CPU
         if map_location is None:
-            if torch.cuda.is_available():
-                map_location = f"cuda:{torch.cuda.current_device()}"
-            else:
-                map_location = "cpu"
+            map_location = f"cuda:{self.local_rank}" if torch.cuda.is_available() else "cpu"
 
         print(f"Loading checkpoint from {checkpoint} to device {map_location}")
         # Explicitly set weights_only=False to handle PyTorch 2.6+ changes
@@ -375,20 +414,25 @@ class SegmentationTrainer(monai.engines.SupervisedTrainer):
         """Run training, if `try_resume_from_checkpoint` tries to
         load previous checkpoint stored at `self.config.model_dir`
         """
+        model_dir = os.environ.get("SM_MODEL_DIR", self.config.model_dir)
+        self.config.model_dir = model_dir
 
-        if try_resume_from_checkpoint:
-            checkpoints = [
-                os.path.join(self.config.model_dir, checkpoint_name)
-                for checkpoint_name in os.listdir(self.config.model_dir)
-                if self.config.run_id in checkpoint_name
-            ]
-            try:
+        try:
+            if try_resume_from_checkpoint:
+                checkpoints = [
+                    os.path.join(self.config.model_dir, checkpoint_name)
+                    for checkpoint_name in os.listdir(self.config.model_dir)
+                    if self.run_id in checkpoint_name
+                ]
+            if checkpoints:
                 checkpoint = sorted(checkpoints)[-1]
                 self.load_checkpoint(checkpoint)
-                print(f"resuming from previous checkpoint at {checkpoint}")
-            except:
-                pass  # train from scratch
-
+                print(f"Resuming from previous checkpoint at {checkpoint}")
+            else:
+                print("No checkpoint found. Starting from scratch.")
+        except:
+            print("Error during checkpoint loading, training from scratch")
+            pass
         # train the model
         super().run()
 
@@ -405,10 +449,13 @@ class SegmentationTrainer(monai.engines.SupervisedTrainer):
             k: [item[1] for item in self.metric_logger.metrics[k]]
             for k in self.evaluator.state.metric_details.keys()
         }
+        if self.local_rank == 0:  # only save on main process
+            os.makedirs(self.config.out_dir, exist_ok=True)
+            # Save metrics and losses to CSV files
+            pd.DataFrame(self.metrics).to_csv(f"{self.config.out_dir}/metric_logs.csv")
+            pd.DataFrame(self.loss).to_csv(f"{self.config.out_dir}/loss_logs.csv")
 
-        # Save metrics and losses to CSV files
-        pd.DataFrame(self.metrics).to_csv(f"{self.config.out_dir}/metric_logs.csv")
-        pd.DataFrame(self.loss).to_csv(f"{self.config.out_dir}/loss_logs.csv")
+        ddp_cleanup()
 
     def fit_one_cycle(self, try_resume_from_checkpoint=True) -> None:
         "Run training using one-cycle-policy"

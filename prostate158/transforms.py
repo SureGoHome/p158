@@ -21,7 +21,6 @@ from monai.transforms import (
     LoadImaged,
     EnsureChannelFirstd,
     EnsureTyped,
-    SaveImaged,
     ScaleIntensityd,
     NormalizeIntensityd,
     SpatialPadd,
@@ -35,11 +34,23 @@ from monai.transforms import (
 ## ---------- base transforms ----------
 # applied everytime
 def get_base_transforms(config: dict, minv: int = 0, maxv: int = 1) -> list:
+    if not isinstance(config.data.image_cols, (list, tuple)):
+        config.data.image_cols = [config.data.image_cols]
 
+    if not isinstance(config.data.label_cols, (list, tuple)):
+        config.data.label_cols = [config.data.label_cols]
     tfms = []
-    tfms += [LoadImaged(keys=config.data.image_cols + config.data.label_cols)]
-    tfms += [EnsureChannelFirstd(keys=config.data.image_cols + config.data.label_cols)]
-
+    tfms+=[LoadImaged(keys=config.data.image_cols+config.data.label_cols)]
+    tfms+=[EnsureChannelFirstd(keys=config.data.image_cols+config.data.label_cols)]
+    if config.transforms.spacing:
+        from monai.transforms import Spacingd
+        tfms+=[
+            Spacingd(
+                keys=config.data.image_cols+config.data.label_cols,
+                pixdim=config.transforms.spacing,
+                mode=config.transforms.mode
+            )
+        ]
     # Ensure proper orientation if specified
     if config.transforms.orientation:
         tfms += [
@@ -60,6 +71,8 @@ def get_base_transforms(config: dict, minv: int = 0, maxv: int = 1) -> list:
 
 def get_train_transforms(config: dict):
     tfms = get_base_transforms(config=config)
+
+    from monai.transforms import Lambda
 
     # ---------- specific transforms for mri ----------
     if "rand_bias_field" in config.transforms.keys():
@@ -100,7 +113,6 @@ def get_train_transforms(config: dict):
                 prob=config.transforms.prob,
             )
         ]
-
     # ---------- affine transforms ----------
 
     if "rand_affine" in config.transforms.keys():
@@ -283,10 +295,15 @@ def get_train_transforms(config: dict):
     # Rename images to `CommonKeys.IMAGE` and labels to `CommonKeys.LABELS`
     # for more compatibility with monai.engines
 
-    tfms += [ConcatItemsd(keys=config.data.image_cols, name=CommonKeys.IMAGE, dim=0)]
+    from monai.transforms import ResizeD
+    target_shape = (64,64,32)
+    tfms += [ResizeD(keys=config.data.image_cols, spatial_size=target_shape, mode="bilinear"),
+             ResizeD(keys=config.data.label_cols, spatial_size=target_shape, mode="nearest"),
+             ConcatItemsd(keys=config.data.image_cols, name=CommonKeys.IMAGE, dim=0)]
 
-    tfms += [ConcatItemsd(keys=config.data.label_cols, name=CommonKeys.LABEL, dim=0)]
-
+    tfms += [ResizeD(keys=config.data.image_cols, spatial_size=target_shape, mode="bilinear"),
+             ResizeD(keys=config.data.label_cols, spatial_size=target_shape, mode="nearest"),
+            ConcatItemsd(keys=config.data.label_cols, name=CommonKeys.LABEL, dim=0)]
     return Compose(tfms)
 
 

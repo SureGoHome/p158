@@ -1,0 +1,5 @@
+__pycache__/
+tumor_*
+/models/
+data/
+.DS_Store/

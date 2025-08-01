@@ -142,7 +142,7 @@ def segmentation_dataloaders(
 
     # Set the number of workers based on config or default
     num_workers_count = (
-        config.data.num_workers if hasattr(config.data, "num_workers") else 16
+        config.data.num_workers if hasattr(config.data, "num_workers") else 4
     )
 
     ## ---------- data dicts ----------
@@ -162,6 +162,8 @@ def segmentation_dataloaders(
     if debug:
         train_df = train_df.sample(25)
         valid_df = valid_df.sample(5)
+    
+    # train_df = train_df.map(lambda x: x.replace("train/", "") if isinstance(x, str) and x.startswith("train/") else x)
 
     train_df["split"] = "train"
     valid_df["split"] = "valid"
