@@ -85,7 +85,7 @@ transforms:
   adjust_contrast:
     gamma: 2.0
 model:
-  type: unet # new option:rrunet3d
+  type: rrunet3d # options: rrunet3d, unet
   channels: [16, 32, 64, 128, 256, 512]
   strides: [2, 2, 2, 2, 2]
   act: PRELU
